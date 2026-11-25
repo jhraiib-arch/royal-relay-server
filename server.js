@@ -1,89 +1,153 @@
+const http = require("http");
 const WebSocket = require("ws");
 
-const PORT = process.env.PORT || 8080;
-const wss = new WebSocket.Server({ port: PORT });
+const PORT = process.env.PORT || 10000;
+
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+  res.end("Royal Relay Server Running");
+});
+
+const wss = new WebSocket.Server({ server });
+
+// প্রতিটি 6-digit কোডের জন্য Host ও Controller সকেট রাখা হবে
 const rooms = new Map();
 
 function getRoom(code) {
   if (!rooms.has(code)) {
-    rooms.set(code, { host: null, controllers: new Set() });
+    rooms.set(code, { host: null, controller: null });
   }
   return rooms.get(code);
 }
 
-function send(ws, obj) {
+function safeSend(ws, payload) {
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(obj));
+    ws.send(JSON.stringify(payload));
   }
 }
 
 wss.on("connection", (ws) => {
   ws.role = null;
-  ws.code = null;
+  ws.roomCode = null;
 
   ws.on("message", (raw) => {
     let data;
     try {
       data = JSON.parse(raw.toString());
-    } catch {
+    } catch (err) {
       return;
     }
 
-    const code = String(data.code || ws.code || "").trim();
+    if (!data || !data.type) return;
 
-    if (data.type === "register_host" && code.length === 6) {
-      ws.role = "host";
-      ws.code = code;
+    // 1. Host রেজিস্টার
+    if (data.type === "register_host" && data.code) {
+      const code = String(data.code).trim();
       const room = getRoom(code);
+
+      if (room.host && room.host !== ws && room.host.readyState === WebSocket.OPEN) {
+        room.host.close(1000, "Replaced by new host");
+      }
+
       room.host = ws;
-      send(ws, { type: "host_ready", code });
-      for (const c of room.controllers) {
-        send(c, { type: "host_online", code });
+      ws.role = "host";
+      ws.roomCode = code;
+
+      safeSend(ws, { type: "host_registered", code });
+
+      if (room.controller && room.controller.readyState === WebSocket.OPEN) {
+        safeSend(room.controller, { type: "host_online", code });
       }
+      return;
     }
 
-    if (data.type === "join_controller" && code.length === 6) {
-      ws.role = "controller";
-      ws.code = code;
+    // 2. Controller যুক্ত হওয়া
+    if (data.type === "join_controller" && data.code) {
+      const code = String(data.code).trim();
       const room = getRoom(code);
-      room.controllers.add(ws);
-      const online = Boolean(room.host && room.host.readyState === WebSocket.OPEN);
-      send(ws, { type: "linked", code, hostOnline: online });
-      if (online) {
-        send(room.host, { type: "controller_joined", code });
+
+      if (room.controller && room.controller !== ws && room.controller.readyState === WebSocket.OPEN) {
+        room.controller.close(1000, "Replaced by new controller");
       }
+
+      room.controller = ws;
+      ws.role = "controller";
+      ws.roomCode = code;
+
+      const hostOnline = Boolean(room.host && room.host.readyState === WebSocket.OPEN);
+      safeSend(ws, { type: "linked", code, hostOnline });
+      return;
     }
 
-    if (data.type === "command" && code.length === 6) {
+    // 3. Controller থেকে Host-এ কমান্ড পাঠানো
+    if (data.type === "command" && data.code) {
+      const code = String(data.code).trim();
       const room = getRoom(code);
       if (room.host && room.host.readyState === WebSocket.OPEN) {
-        send(room.host, { type: "command", code, cmd: data.cmd, time: Date.now() });
+        safeSend(room.host, {
+          type: "command",
+          code,
+          cmd: data.cmd
+        });
       } else {
-        send(ws, { type: "error", message: "Host offline" });
+        safeSend(ws, {
+          type: "host_offline",
+          code
+        });
       }
+      return;
     }
 
-    if (data.type === "reply" && code.length === 6) {
+    // 4. Host থেকে Controller-এ রিপ্লাই পাঠানো
+    if (data.type === "reply" && data.code) {
+      const code = String(data.code).trim();
       const room = getRoom(code);
-      for (const c of room.controllers) {
-        send(c, { type: "reply", code, cmd: data.cmd, output: data.output });
+      if (room.controller && room.controller.readyState === WebSocket.OPEN) {
+        safeSend(room.controller, {
+          type: "reply",
+          code,
+          cmd: data.cmd,
+          output: data.output
+        });
+      }
+      return;
+    }
+
+    // 5. Host থেকে Controller-এ লাইভ স্ক্রিন ফ্রেম পাঠানো
+    if (data.type === "screen_frame" && data.code && data.img) {
+      const code = String(data.code).trim();
+      const room = getRoom(code);
+      if (room.controller && room.controller.readyState === WebSocket.OPEN) {
+        safeSend(room.controller, {
+          type: "screen_frame",
+          code,
+          img: data.img
+        });
       }
     }
   });
 
   ws.on("close", () => {
-    if (!ws.code) return;
-    const room = getRoom(ws.code);
+    const code = ws.roomCode;
+    if (!code || !rooms.has(code)) return;
+
+    const room = rooms.get(code);
+
     if (ws.role === "host" && room.host === ws) {
       room.host = null;
-      for (const c of room.controllers) {
-        send(c, { type: "host_offline", code: ws.code });
+      if (room.controller && room.controller.readyState === WebSocket.OPEN) {
+        safeSend(room.controller, { type: "host_offline", code });
       }
+    } else if (ws.role === "controller" && room.controller === ws) {
+      room.controller = null;
     }
-    if (ws.role === "controller") {
-      room.controllers.delete(ws);
+
+    if (!room.host && !room.controller) {
+      rooms.delete(code);
     }
   });
 });
 
-console.log("Server running on port", PORT);
+server.listen(PORT, () => {
+  console.log(`Royal Relay Server listening on port ${PORT}`);
+});
